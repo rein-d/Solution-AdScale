@@ -1,0 +1,84 @@
+@startuml
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Deployment.puml
+
+LAYOUT_TOP_DOWN()
+
+title C4 Deployment — Edge-топология API Gateway для DSP-интеграции
+
+skinparam legendBackgroundColor #F7F7F7
+skinparam legendBorderColor #BBBBBB
+skinparam legendFontColor #222222
+
+' ====================== Внешний участник ======================
+Person_Ext(dsp, "DSP-партнёры", "OpenRTB 2.6 / HTTPS, mTLS\nP95 ≤ 80 мс по контракту")
+
+' ====================== Глобальный вход ======================
+Deployment_Node(gslb, "GSLB / Geo-DNS + Anycast", "Global", "Health-based маршрутизация в регион и AZ,\nпереключение за секунды")
+
+' ====================== Edge zone ======================
+Deployment_Node(edgeZone, "Edge zone · Kubernetes", "3 AZ · по одному Envoy-поду на узел", "") {
+
+    Deployment_Node(az1, "AZ 1", "nodegroup") {
+        Container(gw1, "Edge Gateway", "Envoy × N", "TLS/mTLS, auth, квоты,\nbreaker, трансляция JSON → gRPC")
+    }
+
+    Deployment_Node(az2, "AZ 2", "nodegroup") {
+        Container(gw2, "Edge Gateway", "Envoy × N", "TLS/mTLS, auth, квоты,\nbreaker, трансляция JSON → gRPC")
+    }
+
+    Deployment_Node(az3, "AZ 3", "nodegroup") {
+        Container(gw3, "Edge Gateway", "Envoy × N", "TLS/mTLS, auth, квоты,\nbreaker, трансляция JSON → gRPC")
+    }
+
+    Container(bidEdge, "Bid Edge", "Go · gRPC · N подов", "Критический путь: приём решения,\nдедлайн ≤ 72 мс")
+    Container(core, "Auction Core", "C++ · N подов", "Отбор, ранжирование, цена\n≤ 20 мс")
+
+    Container(collector, "Event Collector", "Go · N подов", "Отдельный beacon-listener,\nпишет в Kafka, не блокирует bid path")
+
+    Container(rls, "Rate Limit Service", "Go · gRPC · 2 реплики", "Token bucket на партнёра,\nскользящее окно")
+    ContainerDb(rlsRedis, "Rate Limit Store", "Redis Cluster", "Счётчики квот, общие для всех AZ")
+}
+
+' ====================== Потоки ======================
+Rel(dsp, gslb, "Bid request", "HTTPS / mTLS")
+Rel(gslb, gw1, "health-based", "маршрутизация")
+Rel(gslb, gw2, "", "")
+Rel(gslb, gw3, "", "")
+
+Rel(gw1, bidEdge, "bid path", "JSON → gRPC, deadline")
+Rel(gw2, bidEdge, "", "")
+Rel(gw3, bidEdge, "", "")
+
+Rel(gw1, collector, "beacon path", "HTTP, отдельный listener")
+Rel(gw2, collector, "", "")
+Rel(gw3, collector, "", "")
+
+Rel(gw1, rls, "проверка квоты", "gRPC, ≤ 0,3 мс")
+Rel(gw2, rls, "", "")
+Rel(gw3, rls, "", "")
+
+Rel(bidEdge, core, "Decide", "gRPC, ≤ 20 мс")
+Rel(rls, rlsRedis, "EVALSHA", "RESP, ≤ 0,3 мс")
+
+' ====================== Легенда ======================
+legend right
+  **Почему так**
+  • GSLB уводит трафик из нездоровой AZ
+    по health-check, а не по DNS TTL.
+  • Gateway stateless: единственное общее
+    состояние — счётчики квот в Redis.
+  • Пути разделены: всплеск beacon
+    (до 60 000 RPS) не конкурирует
+    с аукционом за лимиты и пулы.
+  • HTTP/2 keep-alive до upstream:
+    нет TLS-хендшейка на каждый запрос.
+
+  **Listeners**
+  bid — JSON → gRPC · beacon — HTTP
+  admin — OIDC/RBAC, отдельная сеть
+
+  **Целевые показатели**
+  18 000 RPS · P95 55 мс · 3 AZ · N+2
+endlegend
+
+@enduml

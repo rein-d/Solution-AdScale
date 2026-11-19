@@ -1,0 +1,82 @@
+@startuml
+autonumber
+skinparam maxMessageSize 165
+skinparam sequenceMessageAlign left
+skinparam responseMessageBelowArrow true
+skinparam shadowing false
+hide footbox
+
+title Sequence — Идемпотентность и повторные попытки в финансовом контуре
+
+participant "Kafka\nimpression.v1" as KFK
+participant "Billing Consumer" as BC
+database "Billing DB\nledger + outbox" as DB
+participant "Outbox relay" as REL
+participant "Kafka\nspend.recorded" as K2
+participant "Reconciliation\nJob (ежедневно)" as REC
+participant "Отчёт DSP" as DSPR
+
+== Попытка 1: транзиентный сбой БД ==
+
+KFK -> BC : impression.v1\n{event_id, impression_id, campaign_id, price_micros}
+activate BC
+BC -> BC : key = impression_id\nidempotency_key = account_id + impression_id
+BC -> DB : BEGIN\nINSERT INTO ledger(account_id, idempotency_key, amount)\nVALUES (...)\nON CONFLICT DO NOTHING;\nUPDATE balance SET spent = spent + amount\nINSERT INTO outbox(spend.recorded, ...)
+activate DB
+DB -x BC : timeout / connection reset
+deactivate DB
+BC -> BC : откат, событие НЕ подтверждено\nbackoff = 200 мс × 2^0 × jitter(0.5..1.0)
+BC -> BC : ожидание ≈ 140 мс
+
+== Попытка 2: успех, повторная доставка безопасна ==
+
+BC -> DB : BEGIN (тот же idempotency_key)
+activate DB
+DB -> DB : проверка unique(account_id, idempotency_key)\nзаписи нет → INSERT
+DB -> DB : UPDATE balance, INSERT outbox
+DB --> BC : COMMIT, ledger_id
+deactivate DB
+BC -> KFK : commit offset\n(после успешной транзакции)
+deactivate BC
+BC -> REL : триггер публикации outbox
+activate REL
+REL -> K2 : spend.recorded.v1\nkey=campaign_id, at-least-once
+deactivate REL
+
+== Дубль от Kafka (at-least-once) ==
+
+KFK -> BC : impression.v1 (тот же event_id)\nпосле ребалансировки
+activate BC
+BC -> DB : BEGIN + тот же idempotency_key
+activate DB
+DB -> DB : unique conflict → DO NOTHING\nвозврат существующего ledger_id
+DB --> BC : COMMIT, ledger_id (тот же)
+deactivate DB
+BC --> KFK : commit offset
+deactivate BC
+note over BC, DB
+  **Результат:** двойного списания нет.
+  Списание аддитивно и не требует порядка сообщений —
+  корректность обеспечивается ключом, а не очерёдностью.
+end note
+
+== Сверка ==
+
+REC -> DB : сумма списаний за сутки по кампаниям
+REC -> DSPR : запрос отчёта партнёра
+DSPR --> REC : факт показов и расход
+REC -> REC : расхождение = |наш расход − отчёт| / отчёт\nпорог ≤ 0,1 % → OK, иначе инцидент
+note right of REC
+  Расхождение > 0,1 % → тикет с перечнем
+  impression_id для точечного разбора и replay.
+end note
+
+note over KFK, REC
+  **Правила повторов:**
+  • Формула: min(cap, base × 2^n) × random(0.5..1.0), полный jitter.
+  • Финансы: 5 попыток, base 200 мс, cap 30 с, затем DLQ.
+  • Retry budget ≤ 10 % трафика — повторы не должны валить зависимость.
+  • В горячем bid path повторов нет вообще: повтор = второй аукцион.
+end note
+
+@enduml

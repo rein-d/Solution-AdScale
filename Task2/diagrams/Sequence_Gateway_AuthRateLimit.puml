@@ -1,0 +1,100 @@
+@startuml
+autonumber
+skinparam maxMessageSize 165
+skinparam sequenceMessageAlign left
+skinparam responseMessageBelowArrow true
+skinparam shadowing false
+hide footbox
+
+title Sequence — API Gateway: аутентификация, квоты, breaker, измерение SLA
+
+participant "DSP-партнёр" as DSP
+participant "GSLB" as GSLB
+participant "Gateway\n(TLS listener)" as TLS
+participant "Auth filter\n+ key cache" as AUTH
+participant "Vault / PKI" as VAULT
+participant "Rate limiter\nlocal + RLS" as RL
+database "Redis\nквоты" as RDS
+participant "Router\n(xDS)" as RT
+participant "Bid Edge\n(gRPC)" as BID
+participant "OTel /\nPrometheus" as OBS
+
+== Установка соединения ==
+
+DSP -> GSLB : POST /rtb/v2/bid
+GSLB -> TLS : маршрутизация в healthy AZ
+TLS -> TLS : TLS 1.3 handshake / resumption\nmTLS: клиентский сертификат
+note right of TLS : Стоимость handshake амортизируется\nkeep-alive и резюмированием сессии
+
+== Аутентификация (≤ 0,5 мс) ==
+
+TLS -> AUTH : расшифрованный запрос\nX-Api-Key, client cert, remote IP
+activate AUTH
+AUTH -> AUTH : поиск ключа в локальном кеше\n(TTL 60 с, O(1))
+alt Ключ в кеше
+    AUTH -> AUTH : проверка: срок, partner_id,\nscopes, IP allowlist
+else Ключ отсутствует в кеше
+    AUTH -> VAULT : получить ключ/статус
+    VAULT --> AUTH : ключ + метаданные
+    AUTH -> AUTH : сохранить в кеш 60 с
+end
+alt Неверный ключ / сертификат / IP
+    AUTH --> DSP : 401 Unauthorized\nбез деталей причины
+    note right of AUTH : Детали только в наших логах,\nчтобы не помогать перебору
+else Аутентификация успешна
+    AUTH -> RL : X-Partner-Id (перезаписан), route=/rtb/v2/bid
+end
+deactivate AUTH
+
+== Ограничение частоты (≤ 0,5 мс) ==
+
+activate RL
+RL -> RL : локальный token bucket\n(партнёр: 3 000 RPS, burst 3 600)
+alt Локальное ведро исчерпано
+    RL --> DSP : 204 + X-No-Bid-Reason: rate_limited\n≈ 1 мс
+    note right of RL : 204, а не 429: не портим\nerror rate партнёра
+else Есть токен
+    RL -> RDS : EVALSHA: глобальный bucket\nkey=rl:{partner_id}
+    activate RDS
+    RDS --> RL : allowed, remaining
+    deactivate RDS
+    alt Global quota exceeded
+        RL --> DSP : 204 + X-RateLimit-Reset
+    else Разрешено
+        RL -> RT : пропустить с классом приоритета P0
+    end
+end
+deactivate RL
+
+== Breaker и маршрутизация (≤ 0,3 мс) ==
+
+activate RT
+RT -> RT : состояние кластера bidding-v2\noutlier detection, pending requests
+alt Breaker OPEN
+    RT --> DSP : 204 + X-No-Bid-Reason: circuit_open\n≈ 2 мс
+    RT -> OBS : gateway_breaker_open_total{cluster}
+else Breaker CLOSED / HALF_OPEN
+    RT -> BID : Decide (JSON → gRPC)\ndeadline = остаток бюджета
+    activate BID
+    BID --> RT : BidResponse или 204
+    deactivate BID
+    RT -> RT : Server-Timing: edge, upstream\nduration histogram по партнёру
+    RT --> DSP : 200 + BidResponse\nили 204 (no-bid)
+end
+deactivate RT
+
+== Наблюдаемость (постоянно) ==
+
+RT -> OBS : gateway_request_duration_seconds{partner,route,code}\ngateway_upstream_duration_seconds\nX-Request-Id = trace id
+OBS -> OBS : SLI: доля ответов ≤ 80 мс ≥ 99,5 %\nburn-rate алерты 14,4×/1 ч, 6×/6 ч
+
+note over AUTH, OBS
+  **Почему так:**
+  • Ни одной удалённой проверки в горячем пути: ключи и JWKS кешируются.
+  • Квоты — два уровня: локальный отсекает всплеск без сети,
+    глобальный держит суммарную квоту между AZ.
+  • Breaker на gateway срабатывает до затрат бюджета сервисом.
+  • Любой отказ — 204 за 1–2 мс, а не 5xx и не ожидание.
+end note
+
+@enduml

@@ -1,0 +1,84 @@
+@startuml
+autonumber
+skinparam maxMessageSize 150
+skinparam sequenceMessageAlign left
+skinparam responseMessageBelowArrow true
+skinparam shadowing false
+hide footbox
+
+title Sequence — Доставка конфигурации кампаний и kill switch
+
+participant "Кабинет\nрекламодателя" as CAB
+participant "Campaign Service\n(Java)" as CMP
+database "Campaign DB" as CDB
+participant "Outbox relay" as REL
+participant "Kafka\ncampaign.changed" as KFK
+participant "Config Sync\n(Bid pod)" as SYNC
+database "Bidding DB\nsnapshot" as BDB
+participant "Campaign Index\n(in-memory)" as IDX
+participant "Инженер\nэксплуатации" as OPS
+participant "Kill switch\n(pub/sub)" as KS
+
+== Изменение кампании ==
+
+CAB -> CMP : PATCH /internal/v1/campaigns/{id}\nIdempotency-Key, If-Match: v41
+activate CMP
+CMP -> CDB : BEGIN
+CMP -> CDB : UPDATE campaign SET ..., version = 42\nWHERE id=? AND version=41
+CMP -> CDB : INSERT INTO outbox(campaign.changed, v42)
+CMP -> CDB : COMMIT
+deactivate CMP
+CMP --> CAB : 200 OK, version=42
+
+== Публикация и применение ==
+
+REL -> CDB : SELECT * FROM outbox\nWHERE published_at IS NULL
+activate REL
+REL -> KFK : campaign.changed.v1\nkey=campaign_id, value v42\nidempotent producer
+KFK --> REL : ack
+REL -> CDB : UPDATE outbox SET published_at=now()
+deactivate REL
+
+KFK -> SYNC : campaign.changed (v42)
+activate SYNC
+SYNC -> SYNC : version 42 > applied 41 ?\nнет → игнорировать (дубль)\nразрыв версий → полный snapshot
+alt Дельта применима
+    SYNC -> BDB : UPSERT campaign_snapshot(v42)
+else Разрыв или checksum mismatch
+    SYNC -> CMP : GET /internal/v1/snapshots/42\nETag, 500 мс
+    CMP --> SYNC : snapshot (N кампаний)
+    SYNC -> BDB : REPLACE snapshot, snapshot_head=v42
+end
+SYNC -> SYNC : собрать новую генерацию индекса\n(без блокировок)
+SYNC -> IDX : atomic swap указателя\nстарая генерация освобождается
+SYNC -> SYNC : commit offset\nметрика config_lag_seconds
+deactivate SYNC
+
+note over SYNC, IDX
+  Цель: лаг конфигурации ≤ 30 с P95, ≤ 5 с для критичных полей.
+  Чтение снапшота из БД — только при старте пода и при разрыве версий.
+end note
+
+== Аварийная остановка (приоритетный путь, ≤ 5 с) ==
+
+OPS -> KS : POST /admin/v1/kill-switch\nscope=campaign:c-771
+activate KS
+KS -> KS : аудит: actor, причина, trace_id
+KS -> SYNC : fan-out через pub/sub\n(не через Kafka: лаг недопустим)
+deactivate KS
+activate SYNC
+SYNC -> IDX : пометить кампанию stopped\nновая генерация индекса
+SYNC --> OPS : подтверждение (≤ 5 с на все поды)
+deactivate SYNC
+
+note over KFK, KS
+  **Почему два канала:**
+  • Kafka — для обычных изменений: порядок по campaign_id,
+    буфер, replay, независимые потребители.
+  • Pub/sub — для kill switch: доставка за секунды,
+    отсутствие зависимости от лага партиции.
+  • Идемпотентность по монотонной version: старые события
+    не могут откатить новую конфигурацию.
+end note
+
+@enduml

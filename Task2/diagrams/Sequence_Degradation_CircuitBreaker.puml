@@ -1,0 +1,96 @@
+@startuml
+autonumber
+skinparam maxMessageSize 165
+skinparam sequenceMessageAlign left
+skinparam responseMessageBelowArrow true
+skinparam shadowing false
+hide footbox
+
+title Sequence — Деградация: circuit breaker, fallback, быстрый 204
+
+participant "DSP" as DSP
+participant "API Gateway" as GW
+participant "Bid Edge" as EDGE
+participant "Targeting" as TGT
+participant "Auction Core" as CORE
+participant "Redis" as RDS
+participant "Kafka" as KFK
+participant "Метрики /\nалерты" as MON
+
+== Сценарий 1: Targeting отвечает медленно (5 мс) ==
+
+DSP -> GW : bid request (tmax=80)
+GW -> EDGE : Decide, deadline 72 мс
+activate EDGE
+EDGE -> TGT : Lookup(segments), deadline 5 мс
+activate TGT
+EDGE -> EDGE : через 3 мс — hedged read\nво второй под (только read-only)
+EDGE -> CORE : параллельно: отбор кандидатов
+note right of TGT : Ответа нет → gRPC DEADLINE_EXCEEDED
+EDGE -x TGT : cancel
+deactivate TGT
+EDGE -> EDGE : breaker: ошибка учтена (окно 10 с)\nставка без сегментов
+CORE --> EDGE : кандидаты + цена (консервативнее)
+EDGE --> GW : 200 + Bid, degraded=true\nX-Degraded: targeting_unavailable
+deactivate EDGE
+GW --> DSP : 200 OK, ≈ 45 мс
+EDGE -> MON : bid_degraded_total{reason=targeting}
+
+note over EDGE, TGT
+  **Почему не retry:** повтор в горячем пути съедает бюджет
+  и создаёт вторую волну. Вместо этого — hedge (для read)
+  и fallback. Retry остаётся для фоновых вызовов.
+  **Порог breaker:** 50 % ошибок за 10 с, минимум 20 запросов,
+  OPEN на 30 с, затем 5 пробных в HALF_OPEN.
+end note
+
+== Сценарий 2: Redis недоступен → консервативный режим ==
+
+DSP -> GW : bid request
+GW -> EDGE : Decide
+EDGE -> CORE : Decide
+activate CORE
+CORE -> RDS : Lua: pacing + freq cap + резерв
+activate RDS
+RDS -x CORE : timeout 4 мс
+deactivate RDS
+CORE -> CORE : breaker Redis: 30 % ошибок → OPEN\nпереход в LOCAL_PACE
+note right of CORE
+  Локальные счётчики в памяти пода:
+  • pacing 70 % от расчётного
+  • резерв без атомарности, окно 1 с
+  • доля трафика в режиме ≤ 10 %
+  • перерасход ограничен сверкой и лимитом кампании
+end note
+CORE --> EDGE : Bid (консервативная ставка)
+deactivate CORE
+EDGE --> GW : 200 + Bid, degraded=true\nX-Degraded: local_pacing
+GW --> DSP : 200 OK
+CORE -> MON : bid_degraded_total{reason=redis_unavailable}
+
+== Сценарий 3: Auction Core деградировал → fail fast ==
+
+DSP -> GW : bid request
+GW -> EDGE : Decide
+activate EDGE
+EDGE -> CORE : Decide
+activate CORE
+CORE -> CORE : P99 > 20 мс, breaker подсчёт
+CORE -x EDGE : DEADLINE_EXCEEDED / UNAVAILABLE
+deactivate CORE
+EDGE -> EDGE : breaker core OPEN\nникаких повторов
+EDGE --> GW : no-bid за 5 мс\nX-No-Bid-Reason: core_unavailable
+deactivate EDGE
+GW --> DSP : 204 No Content, ≈ 6 мс
+EDGE -> MON : gateway_breaker_state=OPEN\nP99 alert, page on-call
+
+note over DSP, MON
+  **Инвариант:** 5xx не используется как режим деградации.
+  Метрики партнёра (error rate) не портятся, штрафов нет,
+  а мы видим инцидент по своим метрикам и breaker-состоянию.
+  **Лестница fallback:** актуальный снапшот → устаревший
+  (≤ 15 мин) → кешированные ставки (≤ 60 с) → дефолтная
+  политика (≤ 10 % трафика) → 204.
+end note
+
+@enduml

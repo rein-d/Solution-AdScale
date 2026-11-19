@@ -1,0 +1,91 @@
+@startuml
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
+
+LAYOUT_TOP_DOWN()
+
+title C4 Component — API Gateway для DSP-интеграции
+
+skinparam legendBackgroundColor #F7F7F7
+skinparam legendBorderColor #BBBBBB
+skinparam legendFontColor #222222
+
+Person_Ext(dsp, "DSP-площадка", "OpenRTB 2.6, mTLS")
+Person_Ext(ops, "Инженер эксплуатации", "Управление маршрутами и квотами")
+
+System_Boundary(edgeZone, "Edge zone (3 AZ)") {
+
+    Component(gslb, "GSLB / Anycast", "Geo-DNS", "Health-based маршрутизация в регион и AZ")
+
+    Container_Boundary(gw, "API Gateway (Envoy)") {
+
+        Component(tls, "TLS / mTLS terminator", "Envoy listener", "TLS 1.3, резюмирование сессии,\nклиентские сертификаты")
+        Component(authn, "Auth filter", "Envoy ext_authz / local cache", "API-ключ, allowlist, JWT для admin;\nпроверка без сетевого вызова")
+        Component(router, "Router", "Envoy route config (xDS)", "partner → cluster, версии, канарейка,\nвеса миграции Strangler Fig")
+        Component(limit, "Rate limiter", "Envoy local + RLS", "Token bucket на партнёра,\nburst, конкурентность")
+        Component(breaker, "Circuit breaker", "Envoy outlier detection", "Выброс подов, лимиты соединений\nи очередей, fail-fast")
+        Component(transcode, "JSON → gRPC transcoder", "Envoy gRPC-JSON", "OpenRTB JSON во внутренний proto")
+        Component(obs, "Observability", "OTel / Prometheus", "Гистограммы по партнёру,\nServer-Timing, трассировка")
+    }
+
+    ContainerDb(rlsRedis, "Rate Limit Store", "Redis Cluster", "Счётчики квот, общие для AZ")
+    Container(vault, "Secrets / CA", "Vault, PKI", "Ключи, сертификаты, ротация")
+    Component(configRepo, "Config as Code", "Git + CI", "Маршруты и квоты партнёров,\nвалидация и canary")
+}
+
+System_Boundary(core, "AdScale core") {
+    Container(bidEdge, "Bid Edge", "Go", "Сервис ставок, gRPC")
+    Container(collector, "Event Collector", "Go", "Beacon показа и клика")
+    Container(monolith, "Legacy Monolith", "C++/Go/Python/Node", "Старый контур на время миграции")
+    Container(adminApi, "Admin API", "Go", "Kill switch, политики ставок")
+}
+
+Rel(dsp, gslb, "Bid request", "HTTPS, P95 ≤ 80 мс")
+Rel(gslb, tls, "Маршрутизация в healthy AZ", "health-check")
+Rel(tls, authn, "Расшифрованный запрос", "in-process")
+Rel(authn, limit, "partner_id доверенный, класс приоритета", "in-process")
+Rel(limit, router, "Пропущенный запрос", "in-process")
+Rel(limit, rlsRedis, "EVALSHA: токен-бакет", "≤ 0,3 мс")
+Rel(router, breaker, "Маршрут и кластер", "in-process")
+Rel(breaker, transcode, "Разрешённый вызов", "in-process")
+Rel(transcode, bidEdge, "Decide", "gRPC / mTLS, deadline")
+Rel(router, monolith, "Миграция: вес трафика", "HTTP (временно)")
+Rel(breaker, collector, "Beacon (отдельный listener)", "HTTP")
+Rel(obs, bidEdge, "Метрики upstream", "pull / OTLP")
+Rel(authn, vault, "Ключи и сертификаты", "кеш 60 с")
+Rel(configRepo, router, "Конфигурация", "xDS, без reload")
+Rel(configRepo, limit, "Квоты партнёров", "xDS")
+Rel(ops, configRepo, "Изменение маршрута/квоты", "Git + review")
+Rel(router, adminApi, "Отдельный admin listener", "OIDC, RBAC")
+
+legend right
+  **Что делает gateway**
+  • Терминация TLS/mTLS и аутентификация
+  • Квоты и защита от перегрузки
+  • Circuit breaker и fail-fast
+  • Маршрутизация и трансляция протокола
+  • Измерение SLA по партнёру
+
+  **Чего не делает**
+  • Не считает ставку и не читает БД
+  • Не повторяет POST /bid
+  • Не меняет тело ответа
+
+  **Режимы ответа**
+  200 — ставка · 204 — no-bid (норма,
+  лимит, breaker) · 400 — невалидный запрос
+  401 — аутентификация · 5xx — только баг
+endlegend
+
+Lay_D(dsp, gslb)
+Lay_D(gslb, tls)
+Lay_D(tls, authn)
+Lay_D(authn, limit)
+Lay_D(limit, breaker)
+Lay_D(breaker, transcode)
+Lay_R(limit, rlsRedis)
+Lay_R(authn, vault)
+Lay_L(router, configRepo)
+Lay_D(transcode, bidEdge)
+Lay_R(transcode, collector)
+
+@enduml

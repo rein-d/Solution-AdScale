@@ -1,0 +1,96 @@
+@startuml
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
+
+LAYOUT_TOP_DOWN()
+
+title C4 Component — Bidding Service: компоненты, границы и зависимости
+
+skinparam legendBackgroundColor #F7F7F7
+skinparam legendBorderColor #BBBBBB
+skinparam legendFontColor #222222
+
+' ====================== Внешние участники ======================
+Person_Ext(dsp, "DSP-площадка", "Отправляет bid request, получает bid response")
+Person_Ext(user, "Пользователь", "Видит баннер, совершает клик")
+
+System_Boundary(adscale, "AdScale Platform") {
+
+    Container(gateway, "API Gateway", "Envoy", "TLS/mTLS, аутентификация партнёра, квоты,\ncircuit breaker, трансляция JSON → gRPC")
+
+    Container_Boundary(bidding, "Bidding Service — bounded context") {
+
+        Component(edge, "Bid Edge", "Go", "OpenRTB → внутренняя модель, валидация,\nидентификация, consent, сборка ответа")
+        Component(core, "Auction Core", "C++ (переиспользован)", "Отбор кандидатов, фильтрация, ранжирование,\nвыбор победителя")
+        Component(pricing, "Pricing Engine", "C++", "Модель ставки, floor, bid shading,\nденьги в micro-USD")
+        Component(pacer, "Pacing & Frequency Cap", "Lua + Redis", "Темп расхода, счётчики частоты,\nрезерв бюджета по auction_id")
+        Component(index, "Campaign Index", "in-memory, copy-on-write", "Обратные индексы placement → кампании,\nкреативы с предсобранным adm")
+        Component(sync, "Config Sync", "Go", "Потребление campaign.changed,\nsnapshot pull, версия и checksum")
+        Component(pub, "Event Publisher", "Go + outbox", "bid.decided, bid.no_bid, телеметрия;\nне блокирует ответ")
+    }
+
+    Container(targeting, "Targeting Service", "Go", "Профиль и сегменты пользователя,\ngRPC, дедлайн 5 мс")
+    Container(campaign, "Campaign Service", "Java", "Единственный писатель конфигурации кампаний")
+    Container(collector, "Event Collector", "Go", "Приём beacon показа и клика")
+    Container(billing, "Billing Service", "Java", "Ledger, балансы, сверка")
+
+    ContainerDb(biddingDb, "Bidding DB", "PostgreSQL", "config_release, политики, snapshot,\noutbox, audit")
+    ContainerDb(redis, "Hot State", "Redis Cluster", "Pacing, frequency cap, резервы;\nне источник истины")
+    ContainerQueue(kafka, "Event Backbone", "Apache Kafka", "campaign.changed, bid.decided,\nimpression, click, spend")
+}
+
+' ====================== Связи: входящие ======================
+Rel(dsp, gateway, "Bid request / response", "OpenRTB 2.6, HTTPS/JSON")
+Rel(gateway, edge, "Decide (аутентифицированный)", "gRPC / mTLS, остаток бюджета")
+Rel(user, collector, "Beacon показа и клика", "HTTPS, асинхронно")
+Rel(collector, kafka, "Публикация события", "idempotent producer")
+
+' ====================== Связи: горячий путь ======================
+Rel(edge, core, "Кандидаты и ставка", "gRPC, ≤ 20 мс")
+Rel(edge, targeting, "Сегменты (опционально)", "gRPC, ≤ 5 мс, hedge")
+Rel(core, index, "Отбор кандидатов", "чтение из памяти, без блокировок")
+Rel(core, pricing, "Расчёт цены", "in-process")
+Rel(core, pacer, "Проверка и резерв бюджета", "Redis, ≤ 2 RTT")
+Rel(pacer, redis, "Lua: проверка + резерв", "RESP, hash tag {campaign_id}")
+Rel(sync, biddingDb, "Версия, snapshot, аудит", "JDBC")
+Rel(sync, kafka, "Чтение campaign.changed", "consumer group")
+Rel(pub, kafka, "События решения и расхода", "outbox + idempotent producer")
+
+' ====================== Связи: конфигурация и деньги ======================
+Rel(campaign, kafka, "CampaignChanged", "outbox")
+Rel(campaign, biddingDb, "Снапшот для pull", "REST /internal/v1/snapshots")
+Rel(kafka, billing, "impression / click", "consumer group")
+Rel(billing, kafka, "События биллинга", "producer")
+
+' ====================== Обоснование ======================
+legend right
+  **Границы сервиса**
+  • Внутри — только решение по аукциону
+    и его горячее состояние.
+  • Конфигурация — read model из Campaign.
+  • Деньги — резерв здесь, списание в Billing.
+  • Нет чтений БД в горячем пути.
+
+  **Почему две единицы развёртывания**
+  • Bid Edge — плотный I/O и внешний протокол.
+  • Auction Core — CPU-bound, переиспользован
+    существующий C++ код (запрет переписывания).
+  • Переход между ними ≤ 2 мс P99.
+
+  **Бюджет P95 = 55 мс**
+  gateway 3 · edge 7 · targeting 5 (параллельно)
+  core 20 · redis 4 · сборка 5 · сеть 11
+endlegend
+
+Lay_D(dsp, gateway)
+Lay_D(gateway, edge)
+Lay_R(edge, core)
+Lay_D(core, index)
+Lay_R(core, pricing)
+Lay_D(core, pacer)
+Lay_D(pacer, redis)
+Lay_L(edge, targeting)
+Lay_D(edge, sync)
+Lay_R(sync, biddingDb)
+Lay_D(campaign, kafka)
+
+@enduml

@@ -1,0 +1,94 @@
+@startuml
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+LAYOUT_TOP_DOWN()
+
+title C4 Container — масштабирование: репликация, шардирование, партиционирование
+
+skinparam legendBackgroundColor #F7F7F7
+skinparam legendBorderColor #BBBBBB
+skinparam legendFontColor #222222
+
+System_Boundary(rep, "Репликация master–slave (RPO 0 там, где критично)") {
+
+    ContainerDb(pgBidP, "Bidding primary", "PostgreSQL", "config, audit, outbox\nзапись ~10 оп/с")
+    ContainerDb(pgBidS, "Bidding sync standby", "другая AZ", "synchronous_commit=remote_write")
+    ContainerDb(pgCampP, "Campaign primary", "PostgreSQL", "кампании, бюджеты\n20–200 RPS записи")
+    ContainerDb(pgCampR, "Campaign read replicas × 2", "другие AZ", "снапшоты и кабинет;\nлаг ≤ 5 с")
+    ContainerDb(pgBilP, "Billing primary", "PostgreSQL", "ledger, баланс\n~30–40 батчей/с")
+    ContainerDb(pgBilAZ, "Billing sync AZ", "другая AZ", "RPO 0 при отказе AZ")
+    ContainerDb(pgBilDR, "Billing sync DR", "регион B", "RPO 0 при потере региона;\n+20–40 мс на батч")
+}
+
+Rel(pgBidP, pgBidS, "sync", "RPO 0")
+Rel(pgCampP, pgCampR, "async", "чтение с реплик")
+Rel(pgBilP, pgBilAZ, "sync", "RPO 0")
+Rel(pgBilP, pgBilDR, "sync (кворум)", "RPO 0")
+
+System_Boundary(shard, "Шардирование по ключу (равномерность + локальность)") {
+
+    ContainerDb(chStats, "ClickHouse Statistics", "4 → 8 шардов × 2", "shard: cityHash64(campaign_id)\npartition: toYYYYMMDD(occurred_at)\nTTL 90 дней")
+    ContainerDb(chMart, "ClickHouse Analytics", "2 → 4 шарда × 2", "shard: cityHash64(campaign_id)\nвитрины mart.*, read-only")
+    ContainerDb(redisBid, "Redis Bidding", "6 → 12 шардов × 2", "hash tag {campaign_id}:\nbid:camp, bid:pace, bid:cap")
+    ContainerQueue(kafka, "Kafka topics", "64 → 128 партиций", "key: campaign_id (события),\nauction_id (телеметрия)")
+}
+
+note right of chStats
+  **Почему campaign_id**
+  - Равномернее advertiser_id (крупный
+    рекламодатель может давать перекос).
+  - Локальнее event_id (агрегаты по
+    кампании на одном шарде).
+end note
+
+note right of redisBid
+  **Почему hash tag**
+  - Lua "проверить и зарезервировать"
+    должна видеть ключи кампании в одном слоте.
+  - Горячие кампании держим под контролем
+    (мониторинг топ-100).
+end note
+
+note bottom of kafka
+  **Почему не user_id**
+  - Порядок по пользователю не нужен.
+  - Локальности по кампании/бюджету не даёт.
+end note
+
+System_Boundary(part, "Партиционирование по времени (OLTP не шардируем)") {
+
+    ContainerDb(ledger, "ledger_entry", "PostgreSQL", "партиции по месяцам;\n2–3 млн строк/сут (3 мес)")
+    ContainerDb(spend, "spend_batch", "PostgreSQL", "окно 15 минут;\nидемпотентность по окну")
+    ContainerDb(audit, "audit_log", "PostgreSQL", "append-only, 12 месяцев")
+    ContainerDb(events, "stats.impression", "ClickHouse", "партиция = день;\nTTL 90 дней → S3")
+}
+
+note right of ledger
+  **Почему Billing не шардируем**
+  - Нужны глобальные сверки и инварианты баланса.
+  - Старые партиции уводим в S3/ClickHouse,
+    а не режем OLTP на шарды.
+end note
+
+note bottom of spend
+  **Порог для шардирования Billing**
+  > 1 ТБ горячего ledger или
+  > 20k транзакций/с — до этого
+  партиционирование и архив.
+end note
+
+legend right
+  **Порядок**
+  1. Кеш — убрать чтения из hot path.
+  2. Разделить хранилища по сервисам.
+  3. Реплики — чтение и HA.
+  4. Шардирование — по порогу.
+
+  **Авто:** HPA подов, KEDA по лагу, read-реплики CH.
+  **По плану:** шарды CH/Redis, вертикаль PG, смена региона.
+
+  **Ориентиры:** 18k→50k RPS, CH 1,04→2,85 млрд строк/сут,
+  Redis 36k→100k оп/с.
+endlegend
+
+@enduml

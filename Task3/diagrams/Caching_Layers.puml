@@ -1,0 +1,85 @@
+@startuml
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+LAYOUT_TOP_DOWN()
+
+title C4 Container — кеш: слои, TTL, инвалидация
+
+skinparam legendBackgroundColor #F7F7F7
+skinparam legendBorderColor #BBBBBB
+skinparam legendFontColor #222222
+
+Person_Ext(user, "Пользователь", "Показ / клик")
+Person_Ext(adv, "Рекламодатель", "Кабинет и отчёты")
+
+System_Boundary(l0, "L0 — CDN (edge)") {
+    Container(cdn, "CDN", "Immutable URL + hash", "Креативы и статика;\nTTL 30–365 дней")
+}
+
+System_Boundary(l1, "L1 — память пода (50–200 нс)") {
+    Container(index, "Campaign Index", "in-memory, copy-on-write", "Кампании, таргетинг, prepared adm;\nверсия + checksum")
+    Container(local, "Local Fallback", "память пода", "Снапшот ≤ 15 мин,\nлокальные счётчики pacing")
+}
+
+System_Boundary(l2, "L2 — Redis Cluster (0,3–1 мс, регион)") {
+    ContainerDb(redisBid, "redis-bid", "6 шардов × 2 · noeviction", "bid:camp, bid:pace, bid:cap,\nbid:kill")
+    ContainerDb(redisRl, "redis-rl", "3 шарда × 2 · noeviction", "rl:{partner_id}:{minute}")
+    ContainerDb(redisCache, "redis-cache", "3 шарда × 2 · allkeys-lru", "cfg:*, bff:*, gw:key, gw:jwks")
+}
+
+System_Boundary(l3, "L3 — источник истины (1–50 мс)") {
+    ContainerDb(pgBid, "Bidding DB", "PostgreSQL", "config_release, snapshot,\naudit, outbox")
+    ContainerDb(pgCamp, "Campaign DB", "PostgreSQL", "кампании, бюджеты,\nверсии, outbox")
+    ContainerDb(pgBilling, "Billing DB", "PostgreSQL", "ledger, баланс, счета")
+    ContainerDb(ch, "ClickHouse", "stats + mart.*", "факты и витрины")
+    ContainerDb(s3, "S3", "snapshot / Parquet", "снапшоты, архив, origin креативов")
+}
+
+Container(bidding, "Bidding Service", "Go + C++", "Аукцион; читает L1,\nрезервирует в L2")
+Container(cabinet, "Cabinet BFF", "REST", "Списки и отчёты;\nкеш в L2")
+Container(gw, "API Gateway", "Envoy", "Квоты в L2,\nключи локально")
+Container(campaign, "Campaign Service", "REST", "Пишет конфиг;\nинвалидация по версии")
+ContainerQueue(kafka, "Kafka", "campaign.changed.v1", "Событие — основной триггер\nинвалидации")
+
+' --- чтение ---
+Rel(user, cdn, "Креатив", "HTTPS")
+Rel(cdn, s3, "origin (miss)", "HTTPS")
+Rel(adv, cabinet, "Отчёты", "HTTPS")
+Rel(bidding, index, "Отбор кандидатов", "без блокировок")
+Rel(bidding, local, "Fallback при отказе L2", "in-process")
+Rel(bidding, redisBid, "Резерв и счётчики", "Lua / RESP ≤ 4 мс")
+Rel(gw, redisRl, "Квота партнёра", "EVALSHA ≤ 0,3 мс")
+Rel(cabinet, redisCache, "cfg:*, bff:*", "RESP")
+Rel(redisCache, pgCamp, "miss", "SQL (read replica)")
+Rel(redisCache, ch, "miss (отчёты)", "Native")
+
+' --- инвалидация ---
+Rel(campaign, pgCamp, "запись + outbox", "SQL")
+Rel(campaign, kafka, "campaign.changed.v1", "outbox, key=campaign_id")
+Rel(kafka, bidding, "применить если version > applied", "consumer group")
+Rel(kafka, cabinet, "инвалидация cfg/bff", "consumer group")
+Rel(bidding, redisBid, "префикс bid:*", "Lua")
+Rel(cabinet, redisCache, "обновление/удаление", "SET / DEL")
+
+legend right
+  **TTL — страховка, не главный механизм**
+  - cfg:campaign 10 мин, но обновляем по событию+версии.
+  - bid:camp 48 ч, write-through, сверка с ledger раз в минуту.
+  - bid:kill 5 с, приоритетный pub/sub (не Kafka).
+  - rl:* окно+запас; bff:report 5 мин; bff:balance 30 с.
+
+  **Не кешируем**
+  - Решение аукциона.
+  - Баланс как источник истины.
+  - Ledger и результаты сверки.
+
+  **Правило**
+  - Потеря любого кеша не меняет деньги
+    и не роняет выдачу.
+endlegend
+
+Lay_R(index, local)
+Lay_R(redisBid, redisRl)
+Lay_R(redisRl, redisCache)
+
+@enduml

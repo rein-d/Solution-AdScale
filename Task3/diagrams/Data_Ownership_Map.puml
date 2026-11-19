@@ -1,0 +1,68 @@
+@startuml
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+LAYOUT_LEFT_RIGHT()
+
+title C4 Container — владение данными: у набора один писатель
+
+skinparam legendBackgroundColor #F7F7F7
+skinparam legendBorderColor #BBBBBB
+skinparam legendFontColor #222222
+
+System_Boundary(services, "Сервисы — владельцы") {
+    Container(campaign, "Campaign Service", "REST", "Пишет конфигурацию кампаний")
+    Container(bidding, "Bidding Service", "Go + C++", "Пишет политики, аудит,\nсчётчики")
+    Container(collector, "Event Collector", "Go", "Принимает события\nи публикует в шину")
+    Container(stats, "Statistics Service", "consumer", "Пишет факты и агрегаты")
+    Container(billing, "Billing Service", "consumer", "Пишет ledger и баланс")
+    Container(reporting, "Reporting", "consumer", "Пишет витрины")
+    Container(dspAdapter, "DSP Adapter", "Go", "Пишет маппинги и состояние")
+}
+
+System_Boundary(data, "Наборы данных — ровно один писатель") {
+    ContainerDb(dsCampaign, "Кампании и бюджеты", "Campaign DB", "источник истины")
+    ContainerDb(dsConfig, "Политики и аудит", "Bidding DB", "источник истины")
+    ContainerDb(dsCounters, "Pacing и резервы", "Redis bid", "горячее состояние,\nвосстановимое")
+    ContainerDb(dsStream, "События в шине", "Kafka", "транспорт/буфер,\nне архив")
+    ContainerDb(dsFacts, "Факты и агрегаты", "ClickHouse stats", "производные от событий")
+    ContainerDb(dsMoney, "Ledger и баланс", "Billing DB", "источник истины")
+    ContainerDb(dsAgg, "Витрины", "ClickHouse mart.*", "производные")
+    ContainerDb(dsMapping, "Маппинги DSP", "Adapter DB", "источник истины")
+}
+
+' --- только запись ---
+Rel(campaign, dsCampaign, "ПИШЕТ", "SQL + outbox")
+Rel(bidding, dsConfig, "ПИШЕТ", "SQL")
+Rel(bidding, dsCounters, "ПИШЕТ", "Lua / RESP")
+Rel(collector, dsStream, "ПИШЕТ", "acks=all, idempotent")
+Rel(stats, dsFacts, "ПИШЕТ", "batch insert")
+Rel(billing, dsMoney, "ПИШЕТ", "SQL, sync commit")
+Rel(reporting, dsAgg, "ПИШЕТ", "ClickHouse")
+Rel(dspAdapter, dsMapping, "ПИШЕТ", "SQL")
+
+legend right
+  **Database per Service**
+  - Свои база/миграции/учётки.
+  - Чужая схема закрыта правами.
+
+  **Финансы**
+  - Ledger append-only, сторно вместо UPDATE.
+  - Баланс для списания — только из primary.
+
+  **Чтение чужих данных (3 варианта)**
+  1. Синхронный API по контракту.
+  2. Подписка на событие.
+  3. Своя перестраиваемая read-модель.
+
+  **Кто читает, но не владеет**
+  - Bidding ← кампании (событие + снапшот).
+  - Statistics/Billing/Reporting ← события.
+  - Cabinet BFF, Analytics — read-only.
+
+  **Нельзя**
+  - SELECT в чужую таблицу.
+  - Общая схема "ради скорости".
+  - Кеш как единственный источник.
+endlegend
+
+@enduml

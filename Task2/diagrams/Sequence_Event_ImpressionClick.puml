@@ -1,0 +1,85 @@
+@startuml
+autonumber
+skinparam maxMessageSize 150
+skinparam sequenceMessageAlign left
+skinparam responseMessageBelowArrow true
+skinparam shadowing false
+hide footbox
+
+title Sequence — События показа и клика: Kafka, дедупликация, учёт вне критического пути
+
+participant "Браузер /\nплеер" as USR
+participant "CDN edge" as CDN
+participant "Event Collector\n(Go)" as COL
+participant "Kafka\nimpression / click" as KFK
+participant "Statistics\n(Kafka Streams)" as ST
+participant "Billing\n(Java)" as BL
+participant "Reporting" as RP
+database "ClickHouse\nanalytics" as CH
+database "Billing DB\nledger" as BDB
+
+== Показ: beacon не влияет на выдачу ==
+
+USR -> CDN : GET nurl?e={event_id}&s={hmac}
+activate CDN
+CDN -> COL : beacon (edge, keep-alive)\nотдельный listener, не bid path
+deactivate CDN
+activate COL
+COL -> COL : проверка HMAC-подписи\nдедуп за 60 с (Redis SETNX)\nмаппинг в Avro-схему
+COL -> KFK : impression.v1\nkey=campaign_id, event_id, ts, price\nidempotent producer, acks=all
+activate KFK
+KFK --> COL : ack (min.insync.replicas=2)
+deactivate KFK
+COL --> USR : 204 / 1×1 gif\n≤ 15 мс
+deactivate COL
+
+note over COL, KFK
+  При недоступности Kafka Collector отвечает 5xx
+  и браузер повторяет beacon. Потеря ≤ 0,01 %.
+  Bid request этого не ждёт: ответ уже отдан.
+end note
+
+== Потребители читают независимо ==
+
+par Статистика
+    KFK -> ST : impression.v1
+    activate ST
+    ST -> ST : дедуп по event_id\nокно 24 ч (state store)
+    ST -> CH : batch insert агрегатов\nидемпотентно по (event_id)
+    deactivate ST
+else Биллинг
+    KFK -> BL : impression.v1\n(event_id, impression_id, price_micros)
+    activate BL
+    BL -> BDB : BEGIN
+    note right of BL
+      INSERT INTO ledger(...)
+      ON CONFLICT (account_id, idempotency_key) DO NOTHING;
+      UPDATE balance ...
+      INSERT INTO outbox(...)
+    end note
+    BDB --> BL : commit
+    BL -> KFK : spend.recorded.v1 (outbox)
+    deactivate BL
+else Отчётность
+    KFK -> RP : impression.v1
+    RP -> CH : materialized view
+end
+
+== Клик: тот же контракт ==
+
+USR -> CDN : GET click_url?e={click_id}&s={hmac}
+CDN -> COL : beacon клика
+activate COL
+COL -> COL : проверка подписи, дедуп по click_id
+COL -> KFK : click.v1 (key=campaign_id)
+deactivate COL
+
+note over ST, BDB
+  **Почему так:**
+  • Запись события ушла из критического пути — освободились 15–25 мс бюджета.
+  • Kafka — буфер и replay: отставший потребитель не теряет данные.
+  • At-least-once + дедуп по event_id = эффективно-однократная обработка.
+  • Отказ Statistics или Reporting не останавливает показы и не влияет на деньги.
+end note
+
+@enduml
