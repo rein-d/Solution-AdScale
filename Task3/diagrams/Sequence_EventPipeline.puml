@@ -1,0 +1,103 @@
+@startuml
+autonumber
+skinparam maxMessageSize 160
+skinparam sequenceMessageAlign left
+skinparam responseMessageBelowArrow true
+skinparam shadowing false
+hide footbox
+
+title Sequence — поток событий: beacon → Kafka → Statistics / Billing / Reporting
+
+participant "Браузер /\nплеер" as USR
+participant "CDN edge" as CDN
+participant "Event Collector\n(Go)" as COL
+participant "Kafka\nimpression.v1" as KFK
+participant "Statistics\nconsumer" as ST
+participant "Billing\nconsumer" as BL
+participant "Reporting\nconsumer" as RP
+database "ClickHouse\nstats" as CH
+database "Billing DB\nledger" as PG
+database "S3\nParquet" as S3
+queue "DLQ" as DLQ
+
+== Приём: событие вне критического пути ==
+
+USR -> CDN : GET nurl?e={event_id}&s={hmac}
+activate CDN
+CDN -> COL : beacon (keep-alive)\nотдельный listener, не bid path
+deactivate CDN
+activate COL
+COL -> COL : проверка HMAC\nдедуп 60 с (Redis SETNX)\nмаппинг в Avro impression.v1
+COL -> KFK : produce key=campaign_id\nacks=all, idempotent
+activate KFK
+KFK --> COL : ack (min.insync.replicas=2)
+deactivate KFK
+COL --> USR : 204 / 1×1 gif\n≤ 15 мс
+deactivate COL
+
+note over COL, KFK
+  Bid request этого не ждёт — ответ партнёру уже отдан.
+  Если Kafka недоступна, Collector отдаёт 5xx и клиент
+  повторяет beacon. Цель потерь ≤ 0,01 %.
+end note
+
+== Потребители читают один поток независимо ==
+
+par Statistics: факты и агрегаты
+    KFK -> ST : impression.v1
+    activate ST
+    ST -> ST : дедуп по event_id\n(окно 60 с + version)
+    ST -> CH : batch insert\nReplacingMergeTree(event_id)
+    CH --> ST : ok
+    ST --> KFK : commit offset
+    deactivate ST
+else Billing: деньги
+    KFK -> BL : impression.v1\n(event_id, impression_id, price_micros)
+    activate BL
+    BL -> PG : BEGIN
+    note right of BL
+      INSERT INTO consumed_offset(topic, partition, offset)
+        ON CONFLICT DO NOTHING;
+      INSERT INTO spend_batch(campaign_id, window)
+        ON CONFLICT DO NOTHING;
+      INSERT INTO ledger_entry(account_id, idempotency_key, amount)
+        ON CONFLICT DO NOTHING;
+      INSERT INTO outbox(spend.v1, ...);
+      COMMIT;
+    end note
+    PG --> BL : commit (sync-реплика)
+    BL -> KFK : spend.v1 (outbox)
+    BL --> KFK : commit offset
+    deactivate BL
+else Reporting: витрины
+    KFK -> RP : impression.v1 / click.v1
+    activate RP
+    RP -> CH : чтение фактов
+    RP -> CH : запись mart.* (идемпотентно)
+    RP --> KFK : commit offset
+    deactivate RP
+end
+
+== Ошибки и восстановление ==
+
+KFK -> DLQ : после N попыток\n(схема, бизнес-правило, "ядовитое")
+note over DLQ
+  Финансовые ошибки — P1. Разбор вручную,
+  затем replay отдельной группой.
+  Сброс offset продовой группы запрещён.
+end note
+
+KFK -> S3 : S3 Sink (Parquet)\npartition by dt / campaign_id
+note over KFK, S3
+  Kafka — буфер, не архив. История > 7 дней в S3/ClickHouse.
+  Replay: из Kafka (7 дней) и S3 (24 мес).
+end note
+
+note over USR, PG
+  - Учёт вынесен из ответа (минус 15–25 мс).
+  - Kafka даёт буфер и replay; отставший потребитель не теряет данные.
+  - At-least-once + дедуп + consumed_offset = фактически однократная обработка.
+  - Сбой Statistics/Reporting не роняет показы и деньги.
+end note
+
+@enduml

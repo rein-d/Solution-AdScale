@@ -1,0 +1,146 @@
+@startuml
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+LAYOUT_TOP_DOWN()
+
+title C4 Container — AdScale TO-BE (горизонт 12 месяцев, 50 000 RPS, SLA 99,9 %)
+
+skinparam legendBackgroundColor #F7F7F7
+skinparam legendBorderColor #BBBBBB
+skinparam legendFontColor #222222
+
+' ====================== Акторы и внешние системы ======================
+Person(advertiser, "Рекламодатель", "Управляет кампаниями, бюджетами и отчётами")
+Person(endUser, "Пользователь", "Видит баннер, совершает клик")
+
+System_Ext(dsp, "DSP-площадки", "Несколько партнёров, OpenRTB 2.x/3.0")
+System_Ext(payment, "Платёжный шлюз", "Пополнение бюджетов, сверка платежей")
+System_Ext(cdn, "CDN", "Раздача креативов и приём tracking-beacon")
+
+Container(gslb, "Global Load Balancer", "Geo-DNS + Anycast", "Маршрутизация по региону и health-статусу, переключение за секунды")
+
+' ====================== Регион A ======================
+System_Boundary(adscale, "AdScale Platform — Region A (active)") {
+
+    Container_Boundary(bidPath, "Критический путь: синхронный, P95 ≤ 100 мс") {
+        Container(gateway, "API Gateway", "Envoy / Istio Ingress", "TLS, аутентификация партнёров, rate limit, канареечный роутинг; без бизнес-логики")
+        Container(bid, "Bid Service", "Go", "Приём и валидация bid request, сборка bid response; stateless, горизонтальное масштабирование")
+        Container(auction, "Auction / Bidding Service", "C++", "Фильтрация кандидатов, расчёт ставки, pacing, frequency cap, выбор победителя")
+        Container(targeting, "Targeting Service", "Go", "Профиль пользователя, сегменты, гео и устройство; чтение из кеша")
+    }
+
+    Container_Boundary(asyncFlow, "Асинхронный контур: события и деньги") {
+        Container(collector, "Event Collector", "Go", "Приём impression/click beacon, валидация, публикация события; не блокирует ответ")
+        ContainerQueue(kafka, "Event Backbone", "Apache Kafka + Schema Registry", "Показы, клики, расходы, изменения конфигурации; replay и идемпотентность")
+        Container(stats, "Statistics Service", "Java / Kafka Streams", "Агрегация и дедупликация событий, запись read-модели")
+        Container(billing, "Billing Service", "Java", "Списание бюджета, ledger, сверка; идемпотентность, outbox")
+        Container(reporting, "Reporting Service", "Python", "Отчёты и выгрузки по read-модели, не влияет на выдачу")
+    }
+
+    Container_Boundary(controlPlane, "Control plane: конфигурация и интеграции") {
+        Container(campaign, "Campaign Service", "Java", "Кампании, креативы, таргетинги, ставки, бюджеты; единственный писатель конфигурации")
+        Container(adapter, "DSP Adapter Service", "Go", "ACL: маппинг кампаний и отчётов, синхронизация с площадками; отдельный адаптер на партнёра")
+        Container(cabinet, "Advertiser Cabinet (BFF)", "Node.js / React", "UI и BFF кабинета, агрегирует API сервисов")
+    }
+
+    Container_Boundary(dataStores, "Данные: изолированное хранилище на сервис") {
+        ContainerDb(cache, "Hot Cache", "Redis Cluster", "Ставки, конфигурация кампаний, frequency cap, pacing; не источник истины")
+        ContainerDb(campaignDb, "Campaign DB", "PostgreSQL", "Кампании, креативы, таргетинги; primary + read replicas")
+        ContainerDb(billingDb, "Billing DB", "PostgreSQL", "Ledger, балансы, счета; ACID, синхронная реплика")
+        ContainerDb(analyticsDb, "Analytics Store", "ClickHouse", "Агрегаты показов и кликов; единственный писатель — Statistics Service")
+        ContainerDb(reportDb, "Reporting Store", "ClickHouse (read replica)", "Материализованные представления для отчётов; изолирован от записи статистики")
+        ContainerDb(profileDb, "Profile Store", "Cassandra + Redis", "Профили пользователей и сегменты")
+        ContainerDb(cabinetDb, "Cabinet DB", "PostgreSQL", "Пользователи, роли, настройки кабинета")
+        ContainerDb(objectStore, "Object Storage", "S3", "Креативы и файлы экспорта отчётов")
+    }
+}
+
+' ====================== Регион B ======================
+Container(regionB, "Region B — горячий резерв / active-active", "Kubernetes, тот же набор контейнеров", "Bid path и event pipeline; переключение через GSLB, RTO ≤ 5 мин")
+
+' ====================== Внешние связи ======================
+BiRel(dsp, gslb, "Bid request / response (OpenRTB)", "HTTPS, P95 ≤ 100 мс")
+Rel(gslb, gateway, "Маршрутизация в healthy-регион", "HTTPS")
+Rel(gateway, bid, "Аутентифицированный запрос", "gRPC / mTLS")
+Rel(bid, targeting, "Профиль и сегменты", "gRPC, кеш, ≤ 5 мс")
+Rel(bid, auction, "Кандидаты и ставка / результат", "gRPC, ≤ 20 мс")
+Rel(auction, cache, "Ставки, caps, счётчики", "Redis, ≤ 2 мс")
+Rel(targeting, profileDb, "Сегменты пользователя", "чтение")
+
+Rel(endUser, cdn, "Баннер, показ и клик", "HTTPS")
+Rel(cdn, objectStore, "Origin-запрос креатива", "HTTPS")
+Rel(cdn, collector, "Beacon с edge", "HTTPS, асинхронно")
+Rel(collector, kafka, "Публикация события", "идемпотентный producer")
+
+Rel(kafka, stats, "Потребление событий", "consumer group")
+Rel(kafka, billing, "События расхода", "consumer group")
+Rel(stats, analyticsDb, "Агрегаты", "batch insert")
+Rel(analyticsDb, reportDb, "Репликация агрегатов", "ClickHouse replication")
+Rel(reporting, reportDb, "Запросы отчётов", "SQL")
+Rel(reporting, objectStore, "Экспорт отчётов", "S3 API")
+Rel(billing, billingDb, "Транзакции ledger", "JDBC")
+Rel(billing, payment, "Платежи и сверка", "HTTPS / REST")
+Rel(billing, kafka, "События биллинга (outbox)", "producer")
+
+Rel(campaign, campaignDb, "Чтение и запись", "JDBC")
+Rel(campaign, objectStore, "Креативы", "S3 API")
+Rel(campaign, kafka, "CampaignChanged (outbox)", "producer")
+Rel(campaign, cache, "Прогрев и инвалидация", "Redis")
+Rel(adapter, campaign, "Маппинг и синхронизация", "REST / gRPC")
+Rel(adapter, dsp, "Выгрузка кампаний, отчёты", "HTTPS / партнёрский API")
+Rel(advertiser, cabinet, "Управление и отчёты", "HTTPS")
+Rel(cabinet, campaign, "Кампании и бюджеты", "REST")
+Rel(cabinet, billing, "Баланс и счета", "REST")
+Rel(cabinet, reporting, "Отчёты", "REST")
+Rel(cabinet, cabinetDb, "Пользователи и настройки", "JDBC")
+
+' ====================== Мультирегион ======================
+Rel(gslb, regionB, "Failover / geo-routing", "health-check")
+Rel(kafka, regionB, "Репликация событий", "MirrorMaker 2")
+Rel(analyticsDb, regionB, "Асинхронная репликация", "native")
+Rel(billingDb, regionB, "Синхронная репликация", "streaming replication")
+
+' ====================== Обоснование границ ======================
+legend right
+  **Целевые показатели**
+  <color:#B36B00> **50 000 RPS**, P95 ≤ 100 мс, SLA 99,9 %
+  <color:#B36B00> Горизонтальное масштабирование, мультирегион
+
+  **Почему такие границы**
+  • **Критический путь** — один профиль нагрузки,
+    stateless, ≤ 3 синхронных перехода.
+  • **Учёт и деньги** — событие после ответа,
+    Kafka как буфер и replay, биллинг ACID.
+  • **Control plane** — низкий RPS, единственный
+    писатель кампаний, адаптеры как ACL.
+  • **Данные** — один писатель на dataset,
+    Redis не источник истины.
+  • **Мультирегион** — active-active bid path,
+    RPO 0 для финансов, RTO ≤ 5 мин.
+
+  **Правила**
+  • Синхронно — только то, что влияет на ответ
+  • Всё остальное — через Kafka и outbox
+  • Отказ аналитики, биллинга или адаптера
+    не останавливает показы
+
+  **Платформа**
+  Kubernetes (мультирегион), Istio: mTLS, retries
+  Наблюдаемость: OpenTelemetry, Prometheus, Grafana
+endlegend
+
+' ====================== Layout hints ======================
+Lay_D(dsp, gslb)
+Lay_D(gslb, gateway)
+Lay_D(gateway, bid)
+Lay_R(bid, targeting)
+Lay_D(bid, auction)
+Lay_D(collector, kafka)
+Lay_R(kafka, billing)
+Lay_D(kafka, stats)
+Lay_D(stats, analyticsDb)
+Lay_D(campaign, campaignDb)
+Lay_D(adapter, campaign)
+Lay_D(cabinet, advertiser)
+
+@enduml

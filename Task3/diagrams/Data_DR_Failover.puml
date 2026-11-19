@@ -1,0 +1,79 @@
+@startuml
+autonumber
+skinparam maxMessageSize 170
+skinparam sequenceMessageAlign left
+skinparam responseMessageBelowArrow true
+skinparam shadowing false
+hide footbox
+
+title Sequence — отказ региона: переключение, проверка RPO/RTO
+
+participant "Мониторинг /\nGSLB" as MON
+participant "Регион A\n(primary)" as RA
+participant "Регион B\n(DR / bid path)" as RB
+database "PostgreSQL B\nsync-реплика" as PGB
+database "Kafka B\nMirrorMaker 2" as KB
+database "S3\nCRR" as S3
+participant "Дежурный\n(runbook)" as OPS
+
+== Обнаружение и переключение трафика ==
+
+RA -> RA : отказ AZ / региона
+MON -> MON : 3 неуспешных health-check\n(интервал 10 с)
+MON -> OPS : P1-инцидент, старт runbook
+MON -> RB : переключение bid path\nпо health-check, не по DNS TTL
+activate RB
+RB -> RB : работа по локальному снапшоту\n≤ 15 мин; проверка версии/checksum
+RB -> RB : Redis пуст → консервативный pacing\n≤ 10 % трафика, 1–2 мин
+deactivate RB
+
+note over MON, RB
+  Bid path остаётся доступным (stateless, БД не ждёт).
+  Деградация — недобор ставок, не 5xx.
+end note
+
+== Деньги: один писатель ==
+
+OPS -> PGB : проверить лаг sync-реплики\nи подтвердить promote
+PGB -> PGB : Patroni: promote в регионе B
+OPS -> RA : fence старого primary\n(кворум etcd + STONITH)
+note right of OPS
+  Два primary недопустимы.
+  Даже при ошибке unique(account_id, idempotency_key)
+  не даст списать дважды; расхождение поймает сверка.
+end note
+
+== События: переключение потребителей ==
+
+KB -> KB : MM2-топики становятся источником
+OPS -> KB : offset-трансляция,\nпотребители в регионе B
+KB -> KB : дедуп по event_id / impression_id\n(повторы безопасны)
+
+== Проверка ==
+
+OPS -> PGB : сверка ledger: count, sum, расхождение
+PGB --> OPS : расхождение ≤ 0,1 %
+OPS -> S3 : проверить доступность архива\nи Object Lock
+OPS -> MON : зафиксировать фактические RPO/RTO\nв отчёте об инциденте
+
+note over OPS, MON
+  **Цели**
+  - Billing: RPO 0, RTO ≤ 5 мин (финал).
+  - Конфигурация: RPO 0, RTO ≤ 5 мин.
+  - Статистика: RPO ≤ 5 мин.
+  - Аналитика: RPO ≤ 1 ч, RTO ≤ 1 ч.
+
+  Не уложились в цель — дефект, не "особенность".
+end note
+
+== Возврат региона A ==
+
+OPS -> RA : поднять как standby,\nресинхронизировать (pg_rewind)
+RA -> RA : догоняет WAL / MirrorMaker 2
+OPS -> OPS : вернуть трафик после сверки\nи стабильности ≥ 30 мин
+note over RA, KB
+  Возврат — отдельная операция с окном,
+  а не автоматический "homecoming".
+end note
+
+@enduml

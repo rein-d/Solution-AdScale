@@ -1,0 +1,85 @@
+@startuml
+autonumber
+skinparam maxMessageSize 160
+skinparam sequenceMessageAlign left
+skinparam responseMessageBelowArrow true
+skinparam shadowing false
+skinparam defaultFontName Sans
+hide footbox
+
+title Sequence — Bid request: нормальный путь (бюджет P95 = 55 мс, SLA партнёра 80 мс)
+
+participant "DSP\n(партнёр)" as DSP
+participant "GSLB" as GSLB
+participant "API Gateway\n(Envoy)" as GW
+participant "Bid Edge\n(Go)" as EDGE
+participant "Targeting\n(gRPC)" as TGT
+participant "Auction Core\n(C++)" as CORE
+participant "Redis\nCluster" as RDS
+participant "Kafka" as KFK
+
+== Приём и защита (≤ 8 мс) ==
+
+DSP -> GSLB : POST /rtb/v2/bid\nOpenRTB 2.6, tmax=80
+activate GSLB
+GSLB -> GW : health-based маршрутизация в AZ\n(ближайший здоровый регион)
+deactivate GSLB
+activate GW
+GW -> GW : mTLS + API-ключ + квота + breaker\n≤ 2 мс, без сетевых вызовов
+note right of GW
+  Дедлайн: now + min(tmax, 80) − overhead
+  При исчерпании квоты или открытом breaker —
+  немедленный 204, запрос не идёт дальше
+end note
+GW -> EDGE : Decide(proto)\ngRPC, deadline = 72 мс
+deactivate GW
+activate EDGE
+
+== Разбор и контекст (≤ 7 мс) ==
+
+EDGE -> EDGE : разбор OpenRTB, валидация схемы\nconsent-политика, user_id → hash\nвыбор placement_key
+note right of EDGE : Никаких чтений БД: только память и кеш
+
+== Параллельная работа над кандидатами (≤ 20 мс) ==
+
+par Сегменты (опционально)
+    EDGE -> TGT : Lookup(user_hash)\ndeadline 5 мс
+    activate TGT
+    TGT --> EDGE : segments[]
+    deactivate TGT
+    note right of TGT
+      Нет ответа за 5 мс или breaker открыт →
+      ставка без сегментов, degraded=true
+    end note
+else Решение по ставке
+    EDGE -> CORE : Decide(imps, context, deadline)
+    activate CORE
+    CORE -> CORE : индекс placement → кандидаты\nфильтр по таргетингу, brand safety, deals\n≤ 12 мс, без аллокаций
+    CORE -> RDS : Lua: pacing + freq cap + резерв\nключи с hash tag {campaign_id}
+    activate RDS
+    RDS --> CORE : разрешено, резерв 30 с\n≤ 4 мс, ≤ 2 RTT
+    deactivate RDS
+    CORE -> CORE : pricing: модель, floor, shading\nранжирование, выбор победителя\nцена в micro-USD
+    CORE --> EDGE : SeatBid + Bid\nconfig_version, degraded=false
+    deactivate CORE
+end
+
+== Сборка ответа (≤ 5 мс) ==
+
+EDGE -> EDGE : предсобранный adm\nnurl/burl с HMAC-подписью\nX-Config-Version
+EDGE ->> KFK : bid.decided (async, вне ответа)\nидемпотентный producer, acks=all
+note right of KFK : Публикация не задерживает ответ
+EDGE --> GW : DecideResponse\n≈ 38 мс собственной обработки
+deactivate EDGE
+activate GW
+GW --> DSP : 200 OK + BidResponse\n≈ 55 мс P95, 70 мс P99
+deactivate GW
+
+note over DSP, KFK
+  **Итог:** сеть 5 + gateway 3 + edge 7 + core 20 + redis 4 + сборка 5 + сеть 6 = 50 мс по этапам.
+  Targeting выполняется параллельно с ядром и не удлиняет цепочку; с запасом на вариативность — 55 мс P95.
+  Резерв 25 мс до контракта 80 мс — на хвост задержки и на деградацию зависимостей.
+  Если до дедлайна осталось < 15 мс — 204 за 5 мс вместо дорогой работы.
+end note
+
+@enduml

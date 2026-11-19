@@ -1,0 +1,85 @@
+@startuml
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Deployment.puml
+
+LAYOUT_TOP_DOWN()
+
+title C4 Deployment — топология данных: 3 AZ, репликация, DR-регион
+
+skinparam legendBackgroundColor #F7F7F7
+skinparam legendBorderColor #BBBBBB
+skinparam legendFontColor #222222
+
+Deployment_Node(gslb, "GSLB / Geo-DNS", "Global", "Маршрутизация по health-check\nbid path между регионами")
+
+Deployment_Node(regionA, "Регион A — primary (active)", "3 AZ, Kubernetes") {
+
+    Deployment_Node(az1, "AZ 1", "nodegroup") {
+        Container(servicesA1, "Сервисы", "Kubernetes", "Gateway, Bid Edge, Core,\nCollector, Campaign, Billing")
+        ContainerDb(pgPrimary, "PostgreSQL primary", "Bidding · Campaign · Billing", "Запись и критичные чтения\nчерез PgBouncer")
+        ContainerDb(redisPrim, "Redis shard primaries", "6 + 3 + 3 шарда", "pacing, cap, квоты, кеш")
+        ContainerDb(chRep1, "ClickHouse replica 1", "4 шарда", "Запись и чтение")
+        ContainerDb(kafkaA1, "Kafka broker 1", "KRaft", "RF=3, minISR=2")
+    }
+
+    Deployment_Node(az2, "AZ 2", "nodegroup") {
+        Container(servicesA2, "Сервисы", "Kubernetes", "N+1 в каждой AZ")
+        ContainerDb(pgSync, "PostgreSQL sync standby", "Bidding · Campaign · Billing", "sync-реплика\n(для Billing — on)")
+        ContainerDb(redisRepl, "Redis replicas", "по одной на шард", "Failover за секунды")
+        ContainerDb(chRep2, "ClickHouse replica 2", "4 шарда", "Чтение и резерв записи")
+        ContainerDb(kafkaA2, "Kafka broker 2", "KRaft", "ISR")
+    }
+
+    Deployment_Node(az3, "AZ 3", "nodegroup") {
+        Container(servicesA3, "Сервисы", "Kubernetes", "Read-реплики и batch-задачи")
+        ContainerDb(pgAsync, "PostgreSQL async read", "Campaign · Billing", "Отчёты/списки;\nлаг ≤ 5 с")
+        ContainerDb(chRep3, "ClickHouse replica 3", "Analytics", "Read-контур,\nизолирует тяжёлые отчёты")
+        ContainerDb(kafkaA3, "Kafka broker 3", "KRaft", "ISR")
+    }
+
+    ContainerDb(s3A, "S3 / Parquet", "Object storage", "Архив событий, снапшоты,\nбэкапы WAL")
+}
+
+Deployment_Node(regionB, "Регион B — DR / bid path", "3 AZ, тёплый контур") {
+    Container(servicesB, "Сервисы", "Kubernetes", "Bid Edge, Collector,\nReporting (read)")
+    ContainerDb(pgDr, "PostgreSQL DR", "Billing sync + async", "RPO 0 для Billing\n(sync-реплика)")
+    ContainerDb(chDr, "ClickHouse replica", "Read-контур", "Питается из MM2;\nRPO ≤ 5 мин")
+    ContainerDb(kafkaB, "Kafka (MM2)", "MirrorMaker 2", "spend ≤ 30 с,\nтелеметрия ≤ 5 мин")
+    ContainerDb(s3B, "S3 replica", "Cross-Region Replication", "Версионирование +\nObject Lock для финансов")
+}
+
+' --- репликация ---
+Rel(gslb, servicesA1, "active", "health-based")
+Rel(gslb, servicesB, "failover ≤ 5 мин", "health-based")
+
+Rel(pgPrimary, pgSync, "sync replication", "RPO 0 при отказе AZ")
+Rel(pgPrimary, pgAsync, "async replication", "лаг ≤ 5 с")
+Rel(pgPrimary, pgDr, "Billing: sync, остальное async", "RPO 0 / ≤ 1 мин")
+
+Rel(redisPrim, redisRepl, "async", "допустима потеря ≤ 30 с счётчиков")
+
+Rel(chRep1, chRep2, "ReplicatedMergeTree", "лаг ≤ 60 с")
+Rel(kafkaA1, kafkaA2, "RF=3", "minISR=2")
+Rel(kafkaA2, kafkaA3, "RF=3", "minISR=2")
+Rel(kafkaA1, kafkaB, "MirrorMaker 2", "RPO ≤ 5 мин")
+Rel(chDr, kafkaB, "consumer", "пересборка витрин")
+
+Rel(s3A, s3B, "CRR", "RPO ≈ 0")
+
+legend right
+  **Отказы**
+  - Узел/AZ: sync-реплика, авто-failover ≤ 60 с.
+  - Регион A: GSLB + DR; Billing RPO 0, остальное ≤ 5 мин.
+
+  **RTO**
+  - Сейчас/промежуточно ≤ 15 мин, цель 12 мес ≤ 5 мин.
+
+  **Логика**
+  - Sync только для конфига и денег.
+  - Статистика восстанавливается из Kafka/S3.
+  - Redis региональный (иначе WAN убьёт 55 мс).
+
+  **Проверка**
+  - Учения failover раз в квартал, фиксируем фактические RPO/RTO.
+endlegend
+
+@enduml
